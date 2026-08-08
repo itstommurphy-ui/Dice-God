@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dice God — Prototype 1</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0c0c10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    color: #eee;
+  }
+  #game-wrap {
+    position: relative;
+    width: 960px;
+    max-width: 100%;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #222;
+  }
+  /* --- TODO: Judgement banner is a placeholder. Restyle/reposition once
+     you've decided what it should actually look like/say. --- */
+  #judgement-banner {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 6px 18px;
+    background: rgba(0,0,0,0.6);
+    border: 2px solid #ffcf6b;
+    font-size: 18px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="game-wrap">
+  <div id="judgement-banner">Judgement 1</div>
+  <canvas id="game" width="960" height="540"></canvas>
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------
+// CONFIG
+// ---------------------------------------------------------------------
+const NUM_DICE = 5;
+const CASTS_PER_JUDGEMENT = 3;
+const JUDGEMENT_TARGETS = [15, 18, 21, 24, 27]; // grows each round, loops if you go past the end
+const ROLL_ANIM_MS = 450;
+const ROLL_FRAME_MS = 90;
+
+const DIE_SLOT_SIZE = 96;   // on-screen box each die sits in
+const DIE_SPACING   = 130;  // distance between die slot centers
+
+// ---------------------------------------------------------------------
+// ASSET PATHS
+// ---------------------------------------------------------------------
+const IMG_PATHS = {
+  faceOne:   "art/sprites/dice/faces/Die-One.png",
+  faceTwo:   "art/sprites/dice/faces/Die-Two.png",
+  faceThree: "art/sprites/dice/faces/Die-Three.png",
+  faceFour:  "art/sprites/dice/faces/Die-Four.png",
+  faceFive:  "art/sprites/dice/faces/Die-Five.png",
+  faceSix:   "art/sprites/dice/faces/Die-Six.png",
+
+  rollOne:   "art/sprites/dice/corners/rolling-one.png",
+  rollTwo:   "art/sprites/dice/corners/rolling-two.png",
+  rollThree: "art/sprites/dice/corners/rolling-three.png",
+
+  outline:   "art/sprites/dice/Die-Outline.png",
+  shadow:    "art/sprites/dice/Dice-Shadow.png",
+
+  cup:       "art/sprites/misc/Dice-Cup.png",
+
+  throwBtn:  "art/sprites/ui/throw-button.png",
+  rerollBtn: "art/sprites/ui/reroll-button.png",
+  pipEmpty:  "art/sprites/ui/cast-pip-empty.png",
+  pipFull:   "art/sprites/ui/cast-pip-full.png",
+  fatePanel: "art/sprites/ui/fate-panel-blank.png",
+  background:"art/sprites/ui/background.png"
+};
+
+const SFX_PATHS = {
+  cupShake:     "sfx/cup_shake.wav",
+  cupThrow:     "sfx/cup_throw.wav", // NB: assumed .wav, you listed .png by mistake
+  diceLand1:    "sfx/dice_land_1.wav",
+  diceLand2:    "sfx/dice_land_2.wav",
+  diceLand3:    "sfx/dice_land_3.wav",
+  uiClick:      "sfx/ui_click.wav",
+  holdToggle:   "sfx/hold_toggle.wav",
+  rerollWhoosh: "sfx/reroll_whoosh.wav",
+  fateSuccess:  "sfx/fate_success.wav",
+  fateFail:     "sfx/fate_fail.wav",
+  judgementAdv: "sfx/next_level.mp3"
+};
+
+const MUSIC_PATH = "music/music_loop.m4a";
+
+// ---------------------------------------------------------------------
+// LOADING (images and audio fail gracefully — missing files draw a
+// magenta placeholder box / silently skip, instead of crashing)
+// ---------------------------------------------------------------------
+const images = {};
+const sounds = {};
+let music = null;
+
+function loadImage(key, path) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => { images[key] = img; resolve(); };
+    img.onerror = () => { images[key] = null; console.warn("Missing image:", path); resolve(); };
+    img.src = path;
+  });
+}
+
+function loadSound(key, path) {
+  const audio = new Audio(path);
+  audio.preload = "auto";
+  audio.onerror = () => console.warn("Missing sound:", path);
+  sounds[key] = audio;
+}
+
+function playSfx(key) {
+  const src = sounds[key];
+  if (!src) return;
+  // Clone so overlapping plays (e.g. rapid clicks) don't cut each other off
+  const clone = src.cloneNode();
+  clone.play().catch(() => {});
+}
+
+function pickLandSfx() {
+  const options = ["diceLand1", "diceLand2", "diceLand3"];
+  return options[Math.floor(Math.random() * options.length)];
+}
+
+// ---------------------------------------------------------------------
+// GAME STATE
+// ---------------------------------------------------------------------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const banner = document.getElementById("judgement-banner");
+
+let dice = []; // { value, held, x, y }
+let judgementIndex = 0;
+let castsRemaining = CASTS_PER_JUDGEMENT;
+let hasThrownThisRound = false;
+let isAnimating = false;
+let animStartTime = 0;
+
+function initDiceRow() {
+  dice = [];
+  const totalWidth = (NUM_DICE - 1) * DIE_SPACING;
+  const startX = canvas.width / 2 - totalWidth / 2;
+  const y = canvas.height / 2;
+  for (let i = 0; i < NUM_DICE; i++) {
+    dice.push({
+      value: 1,
+      held: false,
+      x: startX + i * DIE_SPACING,
+      y: y
+    });
+  }
+}
+
+function currentTarget() {
+  return JUDGEMENT_TARGETS[judgementIndex % JUDGEMENT_TARGETS.length];
+}
+
+function currentSum() {
+  return dice.reduce((sum, d) => sum + d.value, 0);
+}
+
+// ---------------------------------------------------------------------
+// ROLL / RESOLVE
+// ---------------------------------------------------------------------
+function startThrow() {
+  if (isAnimating || castsRemaining <= 0) return;
+
+  playSfx("cupShake");
+
+  setTimeout(() => {
+    playSfx("cupThrow");
+    isAnimating = true;
+    animStartTime = performance.now();
+
+    // Decide final values now; animation just delays reveal
+    dice.forEach(d => {
+      if (!d.held) d.pendingValue = 1 + Math.floor(Math.random() * 6);
+    });
+
+    setTimeout(resolveThrow, ROLL_ANIM_MS);
+  }, 350);
+}
+
+function resolveThrow() {
+  dice.forEach(d => {
+    if (!d.held && d.pendingValue) d.value = d.pendingValue;
+  });
+  isAnimating = false;
+  hasThrownThisRound = true;
+  castsRemaining--;
+
+  playSfx(pickLandSfx());
+
+  checkOutcome();
+}
+
+function checkOutcome() {
+  const sum = currentSum();
+  const target = currentTarget();
+
+  if (sum >= target) {
+    playSfx("fateSuccess");
+    setTimeout(advanceJudgement, 700);
+  } else if (castsRemaining <= 0) {
+    playSfx("fateFail");
+    setTimeout(advanceJudgement, 700); // TODO: decide fail behaviour (retry vs game over)
+  }
+}
+
+// TODO placeholder: replace with real Judgement progression / banner design
+// once you've seen this running and know what info it should actually show.
+function advanceJudgement() {
+  playSfx("judgementAdv");
+  judgementIndex++;
+  castsRemaining = CASTS_PER_JUDGEMENT;
+  hasThrownThisRound = false;
+  dice.forEach(d => { d.held = false; });
+  banner.textContent = "Judgement " + (judgementIndex + 1);
+}
+
+// ---------------------------------------------------------------------
+// INPUT
+// ---------------------------------------------------------------------
+canvas.addEventListener("click", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const mx = (e.clientX - rect.left) * scaleX;
+  const my = (e.clientY - rect.top) * scaleY;
+
+  // Throw / Reroll button
+  const btn = getButtonBounds();
+  if (pointInRect(mx, my, btn)) {
+    playSfx("uiClick");
+    if (hasThrownThisRound && !isAnimating) playSfx("rerollWhoosh");
+    startThrow();
+    return;
+  }
+
+  // Dice (toggle hold) — only after first throw this round, not mid-animation
+  if (!hasThrownThisRound || isAnimating) return;
+  for (const d of dice) {
+    const half = DIE_SLOT_SIZE / 2;
+    if (mx > d.x - half && mx < d.x + half && my > d.y - half && my < d.y + half) {
+      d.held = !d.held;
+      playSfx("holdToggle");
+      break;
+    }
+  }
+});
+
+function pointInRect(x, y, r) {
+  return x > r.x && x < r.x + r.w && y > r.y && y < r.y + r.h;
+}
+
+function getButtonBounds() {
+  const w = 160, h = 48;
+  return { x: canvas.width / 2 - w / 2, y: canvas.height - 90, w, h };
+}
+
+// ---------------------------------------------------------------------
+// RENDER
+// ---------------------------------------------------------------------
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  drawImageOrPlaceholder("background", 0, 0, canvas.width, canvas.height);
+
+  // Fate panel + text
+  drawImageOrPlaceholder("fatePanel", canvas.width / 2 - 100, 20, 200, 64);
+  ctx.fillStyle = "#fff";
+  ctx.font = "20px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(currentSum() + " / " + currentTarget(), canvas.width / 2, 58);
+
+  // Cup, decorative
+  drawImageOrPlaceholder("cup", canvas.width / 2 - 32, canvas.height / 2 - 160, 64, 64);
+
+  // Dice
+  const now = performance.now();
+  const rollFrames = ["rollOne", "rollTwo", "rollThree"];
+  dice.forEach(d => {
+    const half = DIE_SLOT_SIZE / 2;
+    drawImageOrPlaceholder("shadow", d.x - half, d.y + half - 12, DIE_SLOT_SIZE, 24);
+
+    let key;
+    if (isAnimating && !d.held) {
+      const frame = Math.floor((now - animStartTime) / ROLL_FRAME_MS) % rollFrames.length;
+      key = rollFrames[frame];
+    } else {
+      key = ["faceOne","faceTwo","faceThree","faceFour","faceFive","faceSix"][d.value - 1];
+    }
+    drawImageOrPlaceholder(key, d.x - half, d.y - half, DIE_SLOT_SIZE, DIE_SLOT_SIZE);
+
+    if (d.held) {
+      drawImageOrPlaceholder("outline", d.x - half, d.y - half, DIE_SLOT_SIZE, DIE_SLOT_SIZE);
+    }
+  });
+
+  // Cast pips
+  const pipSize = 24, pipGap = 6;
+  const pipsTotalWidth = CASTS_PER_JUDGEMENT * pipSize + (CASTS_PER_JUDGEMENT - 1) * pipGap;
+  let px = canvas.width / 2 - pipsTotalWidth / 2;
+  const py = canvas.height - 140;
+  for (let i = 0; i < CASTS_PER_JUDGEMENT; i++) {
+    const key = i < castsRemaining ? "pipFull" : "pipEmpty";
+    drawImageOrPlaceholder(key, px, py, pipSize, pipSize);
+    px += pipSize + pipGap;
+  }
+
+  // Throw / Reroll button
+  const btn = getButtonBounds();
+  const btnKey = hasThrownThisRound ? "rerollBtn" : "throwBtn";
+  drawImageOrPlaceholder(btnKey, btn.x, btn.y, btn.w, btn.h);
+
+  requestAnimationFrame(draw);
+}
+
+function drawImageOrPlaceholder(key, x, y, w, h) {
+  const img = images[key];
+  if (img) {
+    ctx.drawImage(img, x, y, w, h);
+  } else {
+    ctx.fillStyle = "#c800c8";
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = "#fff";
+    ctx.strokeRect(x, y, w, h);
+  }
+}
+
+// ---------------------------------------------------------------------
+// BOOT
+// ---------------------------------------------------------------------
+async function boot() {
+  const imgLoads = Object.entries(IMG_PATHS).map(([k, p]) => loadImage(k, p));
+  Object.entries(SFX_PATHS).forEach(([k, p]) => loadSound(k, p));
+
+  music = new Audio(MUSIC_PATH);
+  music.loop = true;
+  music.volume = 0.5;
+
+  await Promise.all(imgLoads);
+
+  initDiceRow();
+  banner.textContent = "Judgement " + (judgementIndex + 1);
+
+  // Browsers block autoplay until a user gesture — start music on first click
+  document.addEventListener("click", () => { music.play().catch(() => {}); }, { once: true });
+
+  requestAnimationFrame(draw);
+}
+
+boot();
+</script>
+
+</body>
+</html>
